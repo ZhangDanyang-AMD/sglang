@@ -111,6 +111,10 @@ def verify_correctness(
         ])
     else:
         cu_seqlens = None
+        
+    # state_abs_diff = torch.abs(initial_state_source_orig - initial_state_source_opt)    
+    # mean_state_abs_diff = state_abs_diff.mean().item()
+    # print(f"Init stat mean Absolute Diff: {mean_state_abs_diff:.6e}")
     
     # Run original implementation
     print("Running original implementation...")

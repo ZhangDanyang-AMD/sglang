@@ -317,26 +317,29 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
 
             # Apply L2 normalization if enabled
             if USE_QK_L2NORM_IN_KERNEL:
-                b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+                b_q_i = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
+                b_k_i = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            else:
+                b_q_i = b_q
+                b_k_i = b_k
 
-            b_q = b_q * scale
+            b_q_i = b_q_i * scale
             b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
 
             # Apply gating to hidden state: h *= exp(g)
             b_h *= tl.exp(b_g)
 
             # Delta rule: v -= sum(h * k, dim=0)
-            b_v -= tl.sum(b_h * b_k[:, None], 0)
+            b_v -= tl.sum(b_h * b_k_i[:, None], 0)
 
             # Apply beta gating: v *= beta
             b_v *= b_beta
 
             # Update hidden state: h += k[:, None] * v[None, :]
-            b_h += b_k[:, None] * b_v[None, :]
+            b_h += b_k_i[:, None] * b_v[None, :]
 
             # Compute output: o = sum(h * q, dim=0)
-            b_o = tl.sum(b_h * b_q[:, None], 0)
+            b_o = tl.sum(b_h * b_q_i[:, None], 0)
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
             # Store final state back to h0_source with bounds checking
@@ -353,6 +356,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
             p_b += 1
             p_a += 1
             p_A_log += 1
+            p_dt_bias += 1
 
         # Update pointers for next timestep
         p_q += H * K
