@@ -272,8 +272,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
     o_v_M = i_v * BV + tl.arange(0, BV)
     v_ele = tl.arange(0, ELE_PER_TILE)
 
-    p_q = q + (bos * H + i_h) * K + o_k_N[:, None] + v_ele[None, :]
-    p_k = k + (bos * H + i_h) * K + o_k_N[:, None] + v_ele[None, :]
+    p_q_base = q + (bos * H + i_h) * K
+    p_k_base = k + (bos * H + i_h) * K
+    p_q = p_q_base + o_k_N[:, None]*ELE_PER_TILE + v_ele[None, :]
+    p_k = p_k_base + o_k_N[:, None]*ELE_PER_TILE + v_ele[None, :]
+    tl.multiple_of(p_q, (1, DWORDS_SIZE))
+    tl.multiple_of(p_k, (1, DWORDS_SIZE))
+    tl.max_contiguous(p_q, (1, DWORDS_SIZE))
+    tl.max_contiguous(p_k, (1, DWORDS_SIZE))
 
     mask_k_N = o_k_N < K//ELE_PER_TILE
     mask_v_N = o_v_N < V//ELE_PER_TILE 
@@ -300,19 +306,24 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
 
     for _ in range(0, T):
         # Load inputs
-        b_q = tl.load(p_q, mask=mask_k_N[:, None] | mask_k_v[None, :], other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k_N[:, None] | mask_k_v[None, :], other=0).to(tl.float32)
+        # b_q = tl.load(p_q, mask=mask_k_N[:, None] | mask_k_v[None, :], other=0).to(tl.float32)
+        # b_k = tl.load(p_k, mask=mask_k_N[:, None] | mask_k_v[None, :], other=0).to(tl.float32)
+        #@TODO add mask
+        b_q = tl.load(p_q).to(tl.float32)
+        b_q = tl.where(mask_k_N[:, None] | mask_k_v[None, :], b_q, 0.0)
+        b_k = tl.load(p_k).to(tl.float32)
+        b_k = tl.where(mask_k_N[:, None] | mask_k_v[None, :], b_k, 0.0)
 
-        p_v = v + (bos * HV + i_h * shared_h) * V + o_v_N[:,None] + v_ele[None,:]
+        p_v = v + (bos * HV + i_h * shared_h) * V + o_v_N[:,None] * ELE_PER_TILE + v_ele[None,:]
         p_b = b + bos * HV + i_h * shared_h
-        p_o = o + ((i_k * all + bos) * HV + i_h * shared_h) * V + o_v_N[:,None] + v_ele[None,:]
+        p_o = o + ((i_k * all + bos) * HV + i_h * shared_h) * V + o_v_N[:,None] * ELE_PER_TILE + v_ele[None,:]
 
         # Gating computation pointers
         p_A_log = A_log + i_h * shared_h
         p_a = a + bos * HV + i_h * shared_h
         p_dt_bias = dt_bias + i_h * shared_h
 
-        # `i` must be a compile-time constant; use masks (no tensor slicing).
+        # # `i` must be a compile-time constant; use masks (no tensor slicing).
         for i in tl.static_range(0, shared_h):
             b_h = tl.zeros([BK, BV], dtype=tl.float32)
             if USE_INITIAL_STATE:
@@ -355,7 +366,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
                 b_k_i = b_k
 
             b_q_i = b_q_i * scale
-            b_v = tl.load(p_v, mask=mask_v_N[:, None] | mask_v_v[None, :], other=0).to(tl.float32)
+            b_v = tl.load(p_v).to(tl.float32)
+            b_v = tl.where(mask_v_N[:, None] | mask_v_v[None, :], b_v, 0.0)
             b_v = b_v.reshape(BV)
 
             # Apply gating to hidden state: h *= exp(g)
@@ -462,6 +474,35 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
     )
     o = o.squeeze(0)
+
+    ms = triton.testing.do_bench(lambda: fused_sigmoid_gating_delta_rule_update_kernel[grid](
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        o=o,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        T=T,
+        B=B,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        ),
+        warmup=2500, rep=3000)
+    
+    print("ori kernel ms", ms)
+
     return o
 
 @input_guard
@@ -526,4 +567,33 @@ def fused_sigmoid_gating_delta_rule_update_opt(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
     )
     o = o.squeeze(0)
+
+    ms = triton.testing.do_bench(lambda: fused_sigmoid_gating_delta_rule_update_kernel_opt[grid](
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        o=o,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        T=T,
+        B=B,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        ),
+        warmup=2500, rep=3000)
+    
+    print("opt kernel ms", ms)
+    
     return o
