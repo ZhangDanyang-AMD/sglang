@@ -251,79 +251,45 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
         bos, eos = i_n * T, i_n * T + T
         all = B * T
 
-    # 4*dwords
-    DWORDS_SIZE: tl.constexpr = 4*4 #Bytes
-    if q.dtype.element_ty == tl.float16:
-        DTYPE_SIZE : tl.constexpr = 2
-    elif q.dtype.element_ty in [tl.float8e5,tl.float8e4nv]:
-        DTYPE_SIZE : tl.constexpr = 1
-    elif q.dtype.element_ty == tl.float32:
-        DTYPE_SIZE : tl.constexpr = 4
-    else:
-        assert False, "No Approved Type"
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
 
-    ELE_PER_TILE: tl.constexpr = DWORDS_SIZE // DTYPE_SIZE
-    tl.static_assert(BV%ELE_PER_TILE==0)
-    tl.static_assert(BK%ELE_PER_TILE==0)
+    p_q = q + (bos * H + i_h) * K + o_k
+    p_k = k + (bos * H + i_h) * K + o_k
 
-    o_k_N = i_k * BK + tl.arange(0, BK // ELE_PER_TILE)
-    o_v_N = i_v * BV + tl.arange(0, BV // ELE_PER_TILE)
-    o_k_M = i_k * BK + tl.arange(0, BK)
-    o_v_M = i_v * BV + tl.arange(0, BV)
-    v_ele = tl.arange(0, ELE_PER_TILE)
-
-    p_q_base = q + (bos * H + i_h) * K
-    p_k_base = k + (bos * H + i_h) * K
-    p_q = p_q_base + o_k_N[:, None]*ELE_PER_TILE + v_ele[None, :]
-    p_k = p_k_base + o_k_N[:, None]*ELE_PER_TILE + v_ele[None, :]
-    tl.multiple_of(p_q, (1, DWORDS_SIZE))
-    tl.multiple_of(p_k, (1, DWORDS_SIZE))
-    tl.max_contiguous(p_q, (1, DWORDS_SIZE))
-    tl.max_contiguous(p_k, (1, DWORDS_SIZE))
-
-    mask_k_N = o_k_N < K//ELE_PER_TILE
-    mask_v_N = o_v_N < V//ELE_PER_TILE 
-    mask_k_M = o_k_M < K
-    mask_v_M = o_v_M < V
-    mask_k_v = v_ele < K%ELE_PER_TILE
-    mask_v_v = v_ele < V%ELE_PER_TILE
+    mask_k = o_k < K
+    mask_v = o_v < V
 
     # 0 :[BK, 0, BV]
     # 1: [BK, 1, BV]
     # ...
     # shared_h-1: [BK, shared_h-1, BV]
-    mask_b_h = mask_k_M[:, None, None] & (mask_v_N[None, :, None] | mask_v_v[None, None, :])     
+    mask_b_h = mask_k[:, None] & mask_v[None, :]     
     if USE_INITIAL_STATE:
         p_h0_base = (
             h0_source
             + i_h *shared_h * K * V
-            + o_k_M[:, None, None] * V
-            + o_v_N[None, :, None] * ELE_PER_TILE
-            + v_ele[None, None, :]
+            + o_k[:, None] * V
+            + o_v[None, :]
         )
         idx = tl.load(h0_indices + i_n)   
         p_h0_base += idx * HV * K * V
 
     for _ in range(0, T):
         # Load inputs
-        # b_q = tl.load(p_q, mask=mask_k_N[:, None] | mask_k_v[None, :], other=0).to(tl.float32)
-        # b_k = tl.load(p_k, mask=mask_k_N[:, None] | mask_k_v[None, :], other=0).to(tl.float32)
-        #@TODO add mask
-        b_q = tl.load(p_q).to(tl.float32)
-        b_q = tl.where(mask_k_N[:, None] | mask_k_v[None, :], b_q, 0.0)
-        b_k = tl.load(p_k).to(tl.float32)
-        b_k = tl.where(mask_k_N[:, None] | mask_k_v[None, :], b_k, 0.0)
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
 
-        p_v = v + (bos * HV + i_h * shared_h) * V + o_v_N[:,None] * ELE_PER_TILE + v_ele[None,:]
+        p_v = v + (bos * HV + i_h * shared_h) * V + o_v
         p_b = b + bos * HV + i_h * shared_h
-        p_o = o + ((i_k * all + bos) * HV + i_h * shared_h) * V + o_v_N[:,None] * ELE_PER_TILE + v_ele[None,:]
+        p_o = o + ((i_k * all + bos) * HV + i_h * shared_h) * V + o_v
 
         # Gating computation pointers
         p_A_log = A_log + i_h * shared_h
         p_a = a + bos * HV + i_h * shared_h
         p_dt_bias = dt_bias + i_h * shared_h
 
-        # # `i` must be a compile-time constant; use masks (no tensor slicing).
+        # `i` must be a compile-time constant; use masks (no tensor slicing).
         for i in tl.static_range(0, shared_h):
             b_h = tl.zeros([BK, BV], dtype=tl.float32)
             if USE_INITIAL_STATE:
@@ -332,8 +298,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
                         p_h0_base
                         + i * K * V
                     )
-                    b_h0 = tl.load(p_h0, mask=mask_b_h, other=0).to(tl.float32)   
-                    b_h += b_h0.reshape(BK, BV)
+                    b_h += tl.load(p_h0, mask=mask_b_h, other=0).to(tl.float32)   
             # Inner loop to update head from 0 to shared_h-1 sequentially
 
             # Compute sigmoid gating
@@ -366,15 +331,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
                 b_k_i = b_k
 
             b_q_i = b_q_i * scale
-            b_v = tl.load(p_v).to(tl.float32)
-            b_v = tl.where(mask_v_N[:, None] | mask_v_v[None, :], b_v, 0.0)
-            b_v = b_v.reshape(BV)
+            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
 
             # Apply gating to hidden state: h *= exp(g)
             b_h *= tl.exp(b_g)
 
             # Delta rule: v -= sum(h * k, dim=0)
-            b_k_i = b_k_i.reshape(BK)
             b_v -= tl.sum(b_h * b_k_i[:, None], 0)
 
             # Apply beta gating: v *= beta
@@ -384,9 +346,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
             b_h += b_k_i[:, None] * b_v[None, :]
 
             # Compute output: o = sum(h * q, dim=0)
-            b_q_i = b_q_i.reshape(BK)
             b_o = tl.sum(b_h * b_q_i[:, None], 0)
-            tl.store(p_o, b_o.reshape(BV//ELE_PER_TILE, ELE_PER_TILE).to(p_o.dtype.element_ty), mask=mask_v_N[:, None] | mask_v_v[None, :])
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
             # Store final state back to h0_source with bounds checking
             if USE_INITIAL_STATE:
@@ -395,7 +356,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
                         p_h0_base
                         + i * K * V
                     )
-                    tl.store(p_h0, b_h.reshape(BK,BV//ELE_PER_TILE,ELE_PER_TILE).to(p_h0.dtype.element_ty), mask=mask_b_h)
+                    tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_b_h)
 
             p_o += V
             p_v += V
