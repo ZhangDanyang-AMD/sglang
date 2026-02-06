@@ -96,7 +96,7 @@ def verify_correctness(
             batch_size, num_heads_v, head_dim_k, head_dim_v, dtype=dtype, device=device
         )
         initial_state_source_opt = initial_state_source_orig.clone()
-        initial_state_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
+        initial_state_indices = (torch.arange(batch_size, device=device, dtype=torch.int32) % batch_size).contiguous()
     else:
         initial_state_source_orig = None
         initial_state_source_opt = None
@@ -104,31 +104,12 @@ def verify_correctness(
     
     # Variable length setup
     if use_varlen:
-        torch.manual_seed(42)
         cu_seqlens = torch.cat([
             torch.tensor([0], dtype=torch.int32, device=device),
             torch.randint(seq_len // 2, seq_len + 1, (batch_size,), dtype=torch.int32, device=device).cumsum(0)
         ])
     else:
         cu_seqlens = None
-            
-    # Run optimized implementation
-    print("Running optimized implementation...")
-    output_opt = fused_sigmoid_gating_delta_rule_update_opt(
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        initial_state_source=initial_state_source_opt,
-        initial_state_indices=initial_state_indices,
-        use_qk_l2norm_in_kernel=use_qk_l2norm,
-        cu_seqlens=cu_seqlens,
-    )
     
     # Run original implementation
     print("Running original implementation...")
@@ -147,7 +128,25 @@ def verify_correctness(
         use_qk_l2norm_in_kernel=use_qk_l2norm,
         cu_seqlens=cu_seqlens,
     )
-    
+            
+    # Run optimized implementation
+    print("Running optimized implementation...")
+    output_opt = fused_sigmoid_gating_delta_rule_update_opt(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source_opt,
+        initial_state_indices=initial_state_indices,
+        use_qk_l2norm_in_kernel=use_qk_l2norm,
+        cu_seqlens=cu_seqlens,
+    )
+
     # Compare outputs
     print("\nComparing outputs...")
     output_match = torch.allclose(output_orig, output_opt, rtol=rtol, atol=atol)
