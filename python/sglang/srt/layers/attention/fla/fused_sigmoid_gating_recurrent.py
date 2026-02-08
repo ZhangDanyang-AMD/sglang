@@ -61,15 +61,15 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel1(
     p_A_log = A_log + i_hv
     p_dt_bias = dt_bias + i_hv
 
-    b_dt_bias = gl.load(p_dt_bias) # f32
+    b_dt_bias = gl.load(p_dt_bias).to(gl.float32) # f32
     b_A_log = gl.load(p_A_log).to(gl.float32) # f32
 
     # Gating computation pointers
     p_a = a + bos * HV + i_hv
     p_b = b + bos * HV + i_hv
 
-    b_a = gl.load(p_a) # f32
-    b_b = gl.load(p_b) # f32
+    b_a = gl.load(p_a).to(gl.float32) # f32
+    b_b = gl.load(p_b).to(gl.float32) # f32
 
     # 4*dwords
     DWORDS_SIZE: gl.constexpr = 4*4 #Bytes
@@ -184,12 +184,13 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel1(
                 + o_k_slice[:, None] * V
                 + o_v_slice[None, :]
             )
-            b_h += gl.load(p_h0).to(gl.float32)  # BKxBVxf32
+            b_h += gl.load(p_h0, mask=mask_h, other=0.0).to(gl.float32)  # BKxBVxf32
+            
 
     for _ in range(0, T):
-        b_k = gl.load(p_k).to(gl.float32)  # BKxf32
-        b_q = gl.load(p_q).to(gl.float32)  # BKxf32
-        b_v = gl.load(p_v).to(gl.float32)  # BVxf32
+        b_k = gl.load(p_k, mask=mask_k_blocked, other=0.0).to(gl.float32)  # BKxf32
+        b_q = gl.load(p_q, mask=mask_k_blocked, other=0.0).to(gl.float32)  # BKxf32
+        b_v = gl.load(p_v, mask=mask_v_blocked, other=0.0).to(gl.float32)  # BVxf32
         
         softplus_beta_inv = 1.0 / softplus_beta
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
@@ -492,44 +493,6 @@ def fused_sigmoid_gating_delta_rule_update(
             num_warps=4,
             num_stages=1,
         )
-
-        torch.cuda.synchronize()
-        
-        initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
-        o_test = o.clone()
-        ms = triton.testing.do_bench(lambda: gluon_fused_sigmoid_gating_delta_rule_update_kernel1[grid](
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            o=o_test, # write
-            h0_source=initial_state_source_test, # update
-            h0_indices=initial_state_indices,
-            cu_seqlens=cu_seqlens,
-            scale=scale,
-            T=T,
-            B=B,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            USE_INITIAL_STATE=initial_state_source is not None,
-            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-            IS_VARLEN=cu_seqlens is not None,
-            num_warps=4,
-            num_stages=1,
-            ),
-            warmup=2500, rep=3000, quantiles=(0.5,))
-        torch.cuda.synchronize()
-        print("opt kernel ms", ms)
-
     else:
         fused_sigmoid_gating_delta_rule_update_kernel[grid](
             A_log=A_log,
@@ -560,44 +523,6 @@ def fused_sigmoid_gating_delta_rule_update(
             num_warps=4,
             num_stages=1,
         )
-
-        torch.cuda.synchronize()
-        
-        initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
-        o_test = o.clone()
-        ms = triton.testing.do_bench(lambda: fused_sigmoid_gating_delta_rule_update_kernel[grid](
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            o=o_test, # write
-            h0_source=initial_state_source_test, # update
-            h0_indices=initial_state_indices,
-            cu_seqlens=cu_seqlens,
-            scale=scale,
-            T=T,
-            B=B,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            USE_INITIAL_STATE=initial_state_source is not None,
-            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-            IS_VARLEN=cu_seqlens is not None,
-            num_warps=4,
-            num_stages=1,
-            ),
-            warmup=2500, rep=3000, quantiles=(0.5,))
-        torch.cuda.synchronize()
-        print("ori kernel ms", ms)
-
     o = o.squeeze(0)
 
     return o
