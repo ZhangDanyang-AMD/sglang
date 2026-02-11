@@ -763,8 +763,7 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel4(
     masky = y_axis == 0
     mask_o = maskx[None,:]&masky[:,None]
 
-    b_h = gl.zeros([BV, BK], dtype=gl.float32, layout=blocked2d)
-    
+    b_h = gl.zeros([BV, BK], dtype=gl.float32, layout=blocked2d)    
     if USE_INITIAL_STATE:
         if idx >= 0:
             p_h0_pr32 = (
@@ -775,8 +774,8 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel4(
                 + o_k_slice_pr32[None, :] 
             )
             # b_h += gl.load(p_h0, mask=mask_h, other=0.0).to(gl.float32)  # BKxBVxf32
-            # Treat each 32-bit lane as packed [fp16_lo | fp16_hi] bits.            
-            b_h += _load_unpack_uint32(p_h0_pr32).reshape([BV,BK])
+            # Treat each 32-bit lane as packed [fp16_lo | fp16_hi] bits.        
+            b_h += gl.convert_layout(_load_unpack_uint32(p_h0_pr32).reshape([BV, BK]), b_h.type.layout)
             
     for _ in range(0, T):
         b_dt_bias = gl.load(p_dt_bias).to(gl.float32) # f32
@@ -836,7 +835,7 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel4(
         b_v = b_v * b_beta
 
         b_v_row = gl.convert_layout(b_v[:, None], b_h.type.layout)
-        b_h += b_k_col * b_v_row # BKxBVxf32  --->  BKxf32 * 16xBVxf32 = BKxBVxf32 ---> diag(bk)16... @ b_v  ---> BK/16 x mfma
+        b_h += b_v_row * b_k_col  # BKxBVxf32  --->  BKxf32 * 16xBVxf32 = BKxBVxf32 ---> diag(bk)16... @ b_v  ---> BK/16 x mfma
 
         # Compute output: o = sum(h * q, dim=0)
         # @TODO: place K in 2nd axis
@@ -867,7 +866,7 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel4(
                 (b_h0_hi.to(gl.uint16, bitcast=True).to(gl.uint32) << 16)
                 | b_h0_lo.to(gl.uint16, bitcast=True).to(gl.uint32)
             )
-            b_h0_pr32 = gl.convert_layout(b_h0_pr32, blocked2d_pr32)
+            # b_h0_pr32 = gl.convert_layout(b_h0_pr32, blocked2d_pr32)
 
             p_h0_pr32 = (
                 h0_source_pr32
@@ -876,6 +875,7 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel4(
                 + o_v_slice_pr32[:, None] * K//2
                 + o_k_slice_pr32[None, :] 
             )
+            b_h0_pr32 = gl.convert_layout(b_h0_pr32, p_h0_pr32.type.layout)
             gl.store(p_h0_pr32, b_h0_pr32.to(p_h0_pr32.dtype.element_ty, bitcast=True))
 
 @triton.jit(do_not_specialize=["T"])
@@ -1470,21 +1470,28 @@ def fused_sigmoid_gating_delta_rule_update(
     grid = (NK, NV, N * HV)
 
     if gluon:        
-        initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
-        o_test = o.clone()
-        print("run into gluon")
+        # initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
+        # o_test = o.clone()
+        # print("run into gluon")
+        # Packed fp16/bf16 path: treat the last K dimension as half2 packed into uint32.
+        q_pr32 = triton.reinterpret(q, tl.uint32)
+        k_pr32 = triton.reinterpret(k, tl.uint32)
+        h0_source_pr32 = (
+            triton.reinterpret(initial_state_source, tl.uint32) if initial_state_source is not None else None
+        )
+
         gluon_fused_sigmoid_gating_delta_rule_update_kernel4[grid](
             A_log=A_log,
             a=a,
             dt_bias=dt_bias,
             softplus_beta=softplus_beta,
             softplus_threshold=softplus_threshold,
-            q_pr32=triton.reinterpret(q, gl.uint32),
-            k_pr32=triton.reinterpret(k, gl.uint32),
+            q_pr32=q_pr32,
+            k_pr32=k_pr32,
             v=v,
             b=b,
             o=o, # write
-            h0_source_pr32=triton.reinterpret(initial_state_source, gl.uint32), # update
+            h0_source_pr32=h0_source_pr32, # update (packed)
             h0_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             scale=scale,
@@ -1508,47 +1515,47 @@ def fused_sigmoid_gating_delta_rule_update(
         # print(gluon_fused_sigmoid_gating_delta_rule_update_kernel4.best_config)
         # print(gluon_fused_sigmoid_gating_delta_rule_update_kernel4.configs_timings)
 
-        torch.cuda.synchronize()
-        ms = triton.testing.do_bench(lambda: gluon_fused_sigmoid_gating_delta_rule_update_kernel4[grid](
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            q_pr32=triton.reinterpret(q, gl.uint32),
-            k_pr32=triton.reinterpret(k, gl.uint32),
-            v=v,
-            b=b,
-            o=o_test, # write
-            h0_source_pr32=triton.reinterpret(initial_state_source, gl.uint32), # update
-            h0_indices=initial_state_indices,
-            cu_seqlens=cu_seqlens,
-            scale=scale,
-            T=T,
-            B=B,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            USE_INITIAL_STATE=initial_state_source is not None,
-            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-            IS_VARLEN=cu_seqlens is not None,
-            T_PER_WARP_K=16,
-            T_PER_WARP_V=4,
-            WARP_SIZE=4,
-            num_warps=4,
-            num_stages=1,
-            ),
-            warmup=25, rep=30,)
-        torch.cuda.synchronize()
-        print("opt kernel ms", ms)
+        # torch.cuda.synchronize()
+        # ms = triton.testing.do_bench(lambda: gluon_fused_sigmoid_gating_delta_rule_update_kernel4[grid](
+        #     A_log=A_log,
+        #     a=a,
+        #     dt_bias=dt_bias,
+        #     softplus_beta=softplus_beta,
+        #     softplus_threshold=softplus_threshold,
+        #     q_pr32=triton.reinterpret(q, gl.uint32),
+        #     k_pr32=triton.reinterpret(k, gl.uint32),
+        #     v=v,
+        #     b=b,
+        #     o=o_test, # write
+        #     h0_source_pr32=triton.reinterpret(initial_state_source, gl.uint32), # update
+        #     h0_indices=initial_state_indices,
+        #     cu_seqlens=cu_seqlens,
+        #     scale=scale,
+        #     T=T,
+        #     B=B,
+        #     H=H,
+        #     HV=HV,
+        #     K=K,
+        #     V=V,
+        #     BK=BK,
+        #     BV=BV,
+        #     USE_INITIAL_STATE=initial_state_source is not None,
+        #     USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        #     IS_VARLEN=cu_seqlens is not None,
+        #     T_PER_WARP_K=16,
+        #     T_PER_WARP_V=4,
+        #     WARP_SIZE=4,
+        #     num_warps=4,
+        #     num_stages=1,
+        #     ),
+        #     warmup=25, rep=30,)
+        # torch.cuda.synchronize()
+        # print("opt kernel ms", ms)
 
     else:        
-        initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
-        o_test = o.clone()
-        gluon_fused_sigmoid_gating_delta_rule_update_kernel1[grid](
+        # initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
+        # o_test = o.clone()
+        fused_sigmoid_gating_delta_rule_update_kernel[grid](
             A_log=A_log,
             a=a,
             dt_bias=dt_bias,
@@ -1578,39 +1585,39 @@ def fused_sigmoid_gating_delta_rule_update(
             num_stages=1,
         )
 
-        torch.cuda.synchronize()
-        ms = triton.testing.do_bench(lambda: gluon_fused_sigmoid_gating_delta_rule_update_kernel1[grid](
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            o=o_test, # write
-            h0_source=initial_state_source_test, # update
-            h0_indices=initial_state_indices,
-            cu_seqlens=cu_seqlens,
-            scale=scale,
-            T=T,
-            B=B,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            USE_INITIAL_STATE=initial_state_source is not None,
-            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-            IS_VARLEN=cu_seqlens is not None,
-            num_warps=4,
-            num_stages=1,
-            ),
-            warmup=25, rep=30,)
-        torch.cuda.synchronize()
-        print("ori kernel ms", ms)
+        # torch.cuda.synchronize()
+        # ms = triton.testing.do_bench(lambda: fused_sigmoid_gating_delta_rule_update_kernel[grid](
+        #     A_log=A_log,
+        #     a=a,
+        #     dt_bias=dt_bias,
+        #     softplus_beta=softplus_beta,
+        #     softplus_threshold=softplus_threshold,
+        #     q=q,
+        #     k=k,
+        #     v=v,
+        #     b=b,
+        #     o=o_test, # write
+        #     h0_source=initial_state_source_test, # update
+        #     h0_indices=initial_state_indices,
+        #     cu_seqlens=cu_seqlens,
+        #     scale=scale,
+        #     T=T,
+        #     B=B,
+        #     H=H,
+        #     HV=HV,
+        #     K=K,
+        #     V=V,
+        #     BK=BK,
+        #     BV=BV,
+        #     USE_INITIAL_STATE=initial_state_source is not None,
+        #     USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        #     IS_VARLEN=cu_seqlens is not None,
+        #     num_warps=4,
+        #     num_stages=1,
+        #     ),
+        #     warmup=25, rep=30,)
+        # torch.cuda.synchronize()
+        # print("ori kernel ms", ms)
 
     o = o.squeeze(0)
 
