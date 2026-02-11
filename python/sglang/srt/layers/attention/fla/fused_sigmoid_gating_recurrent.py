@@ -536,59 +536,71 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel1(
             b_o = gl.convert_layout(b_o, layout=blocked1)
             gl.store(p_o, b_o)
 
-do_bench = lambda kernel, quantiles: triton.testing.do_bench(kernel, quantiles=quantiles, warmup=1, rep=1)
-def gdr_get_configs():
-    # Only keep configs that make threads_per_warp = [T_PER_WARP_V, T_PER_WARP_K]
-    # valid: T_PER_WARP_V = warp_size // T_PER_WARP_K must be >= 1.
-    return [
-        # T_PER_WARP_V: 32, V_PER_THREAD: 1
-        triton.Config({"T_PER_WARP_K": 2}, num_warps=4, num_stages=1),
-        # T_PER_WARP_V: 16, V_PER_THREAD: 2
-        triton.Config({"T_PER_WARP_K": 4}, num_warps=4, num_stages=1),
-        # T_PER_WARP_V: 8, V_PER_THREAD: 4
-        triton.Config({"T_PER_WARP_K": 8}, num_warps=4, num_stages=1),
+@gluon.jit
+def _load_unpack_uint32(ptr):
+    b_h0 = gl.load(ptr).to(gl.uint32, bitcast=True)  # BV x (BK//2) packed
+    b_h0_lo = (b_h0 & 0xFFFF).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
+    b_h0_hi = (b_h0 >> 16).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
+    b_h0 = gl.join(b_h0_lo, b_h0_hi)
+    return b_h0
 
-        # T_PER_WARP_V: 64, V_PER_THREAD: 1
-        triton.Config({"T_PER_WARP_K": 1}, num_warps=2, num_stages=1),
-        # T_PER_WARP_V: 32, V_PER_THREAD: 2
-        triton.Config({"T_PER_WARP_K": 2}, num_warps=2, num_stages=1),
-        # T_PER_WARP_V: 16, V_PER_THREAD: 4
-        triton.Config({"T_PER_WARP_K": 4}, num_warps=2, num_stages=1),
-        # T_PER_WARP_V: 8, V_PER_THREAD: 8
-        triton.Config({"T_PER_WARP_K": 8}, num_warps=2, num_stages=1),
-        # T_PER_WARP_V: 4, V_PER_THREAD: 16
-        triton.Config({"T_PER_WARP_K": 16}, num_warps=2, num_stages=1),
+# do_bench = lambda kernel, quantiles: triton.testing.do_bench(kernel, quantiles=quantiles, warmup=5, rep=2)
+# def gdr_get_configs():
+#     # Only keep configs that make threads_per_warp = [T_PER_WARP_V, T_PER_WARP_K]
+#     # valid: T_PER_WARP_V = warp_size // T_PER_WARP_K must be >= 1.
+#     return [
+#         # T_PER_WARP_V: 32, V_PER_THREAD: 1
+#         triton.Config({"T_PER_WARP_K": 2}, num_warps=4, num_stages=1),
+#         # T_PER_WARP_V: 16, V_PER_THREAD: 2
+#         triton.Config({"T_PER_WARP_K": 4}, num_warps=4, num_stages=1),
+#         # T_PER_WARP_V: 8, V_PER_THREAD: 4
+#         triton.Config({"T_PER_WARP_K": 8}, num_warps=4, num_stages=1),
+#         # T_PER_WARP_V: 4, V_PER_THREAD: 8
+#         triton.Config({"T_PER_WARP_K": 16}, num_warps=4, num_stages=1),
 
-        # T_PER_WARP_V: 64, V_PER_THREAD: 2
-        triton.Config({"T_PER_WARP_K": 1}, num_warps=1, num_stages=1),
-        # T_PER_WARP_V: 32, V_PER_THREAD: 4
-        triton.Config({"T_PER_WARP_K": 2}, num_warps=1, num_stages=1),
-        # T_PER_WARP_V: 16, V_PER_THREAD: 8
-        triton.Config({"T_PER_WARP_K": 4}, num_warps=1, num_stages=1),
-        # T_PER_WARP_V: 8, V_PER_THREAD: 16
-        triton.Config({"T_PER_WARP_K": 8}, num_warps=1, num_stages=1),
-    ]
+#         # T_PER_WARP_V: 64, V_PER_THREAD: 1
+#         triton.Config({"T_PER_WARP_K": 1}, num_warps=2, num_stages=1),
+#         # T_PER_WARP_V: 32, V_PER_THREAD: 2
+#         triton.Config({"T_PER_WARP_K": 2}, num_warps=2, num_stages=1),
+#         # T_PER_WARP_V: 16, V_PER_THREAD: 4
+#         triton.Config({"T_PER_WARP_K": 4}, num_warps=2, num_stages=1),
+#         # T_PER_WARP_V: 8, V_PER_THREAD: 8
+#         triton.Config({"T_PER_WARP_K": 8}, num_warps=2, num_stages=1),
+#         # T_PER_WARP_V: 4, V_PER_THREAD: 16
+#         triton.Config({"T_PER_WARP_K": 16}, num_warps=2, num_stages=1),
 
-@triton.autotune(configs=gdr_get_configs(), key=['K'], do_bench=do_bench)
-@triton.heuristics(
-    {
-        "T_PER_WARP_V": lambda nargs: 64 // nargs["T_PER_WARP_K"],
-        "WARP_SIZE": lambda nargs: nargs["num_warps"]
-    }
-)  # test kwargs
+#         # T_PER_WARP_V: 64, V_PER_THREAD: 2
+#         triton.Config({"T_PER_WARP_K": 1}, num_warps=1, num_stages=1),
+#         # T_PER_WARP_V: 32, V_PER_THREAD: 4
+#         triton.Config({"T_PER_WARP_K": 2}, num_warps=1, num_stages=1),
+#         # T_PER_WARP_V: 16, V_PER_THREAD: 8
+#         triton.Config({"T_PER_WARP_K": 4}, num_warps=1, num_stages=1),
+#         # T_PER_WARP_V: 8, V_PER_THREAD: 16
+#         triton.Config({"T_PER_WARP_K": 8}, num_warps=1, num_stages=1),
+#         # T_PER_WARP_V: 4, V_PER_THREAD: 8
+#         triton.Config({"T_PER_WARP_K": 16}, num_warps=1, num_stages=1),
+#     ]
+
+# @triton.autotune(configs=gdr_get_configs(), key=['K'], do_bench=do_bench)
+# @triton.heuristics(
+#     {
+#         "T_PER_WARP_V": lambda nargs: 64 // nargs["T_PER_WARP_K"],
+#         "WARP_SIZE": lambda nargs: nargs["num_warps"]
+#     }
+# )  # test kwargs
 @gluon.jit(do_not_specialize=["T"])
-def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
+def gluon_fused_sigmoid_gating_delta_rule_update_kernel4(
     A_log,
     a,
     dt_bias,
     softplus_beta,
     softplus_threshold,
-    q,
-    k,
+    q_pr32,
+    k_pr32,
     v,
     b,
     o,
-    h0_source,
+    h0_source_pr32,
     h0_indices,
     cu_seqlens,
     scale,
@@ -637,11 +649,11 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
 
     # 4*dwords
     DWORDS_SIZE: gl.constexpr = 4*4 #Bytes
-    if q.dtype.element_ty == gl.float16:
+    if o.dtype.element_ty == gl.float16:
         DTYPE_SIZE : gl.constexpr = 2
-    elif q.dtype.element_ty == gl.float8e5 or q.dtype.element_ty == gl.float8e4nv:
+    elif o.dtype.element_ty == gl.float8e5 or o.dtype.element_ty == gl.float8e4nv:
         DTYPE_SIZE : gl.constexpr = 1
-    elif q.dtype.element_ty == gl.float32:
+    elif o.dtype.element_ty == gl.float32:
         DTYPE_SIZE : gl.constexpr = 4
     else:
         DTYPE_SIZE : gl.constexpr = 2
@@ -652,6 +664,12 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
 
     # h
     V_PER_THREAD: gl.constexpr=BV//T_PER_WARP_V//WARP_SIZE
+    blocked2d_pr32: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[V_PER_THREAD, BK//T_PER_WARP_K//2],
+        threads_per_warp=[T_PER_WARP_V, T_PER_WARP_K],
+        warps_per_cta=[WARP_SIZE, 1],
+        order=[1, 0],
+    )
     blocked2d: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[V_PER_THREAD, BK//T_PER_WARP_K],
         threads_per_warp=[T_PER_WARP_V, T_PER_WARP_K],
@@ -665,6 +683,12 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
         warps_per_cta=[WARP_SIZE, 1],
         order=[1, 0],
     )
+    blocked1_pr32: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, BK//T_PER_WARP_K//2],
+        threads_per_warp=[T_PER_WARP_V, T_PER_WARP_K],
+        warps_per_cta=[WARP_SIZE, 1],
+        order=[1, 0],
+    )
     # v
     blocked2: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[V_PER_THREAD, 1],
@@ -673,54 +697,41 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
         order=[0, 1],
     )
     
-    slice1_b2d: gl.constexpr = gl.SliceLayout(
+    slice1_b2d_pr32: gl.constexpr = gl.SliceLayout(
         dim=0,
-        parent=blocked2d,
+        parent=blocked2d_pr32,
     )
-    slice2_b2d: gl.constexpr = gl.SliceLayout(
+    slice2_b2d_pr32: gl.constexpr = gl.SliceLayout(
         dim=1,
-        parent=blocked2d,
+        parent=blocked2d_pr32,
     )
 
-    # slice1_b1d1: gl.constexpr = gl.SliceLayout(
-    #     dim=1,
-    #     parent=blocked1,
-    # )
     slice2_b1d1: gl.constexpr = gl.SliceLayout(
         dim=0,
         parent=blocked1,
+    )
+    slice2_b1d1_pr32: gl.constexpr = gl.SliceLayout(
+        dim=0,
+        parent=blocked1_pr32,
     )
 
     slice1_b1d2: gl.constexpr = gl.SliceLayout(
         dim=1,
         parent=blocked2,
     )
-    # slice2_b1d2: gl.constexpr = gl.SliceLayout(
-    #     dim=0,
-    #     parent=blocked2,
-    # )
-
-    # slice1_b1d3: gl.constexpr = gl.SliceLayout(
-    #     dim=1,
-    #     parent=blocked3,
-    # )
-    # slice2_b1d3: gl.constexpr = gl.SliceLayout(
-    #     dim=0,
-    #     parent=blocked3,
-    # )
 
     o_k_base = i_k * BK
     o_v_base = i_v * BV
     # o_k_blocked_M = i_k * BK + gl.arange(0, BK, layout=slice1_b1d1)
-    o_k_blocked_N = o_k_base + gl.arange(0, BK, layout=slice2_b1d1)
+    o_k_blocked_N_pr32 = o_k_base//2 + gl.arange(0, BK//2, layout=slice2_b1d1_pr32)
     o_v_blocked_M = o_v_base + gl.arange(0, BV, layout=slice1_b1d2)
     # o_v_blocked_N = i_v * BV + gl.arange(0, BV, layout=slice2_b1d2)
-    o_k_slice = o_k_base + gl.arange(0, BK, layout=slice1_b2d)
-    o_v_slice = o_v_base + gl.arange(0, BV, layout=slice2_b2d)
+    o_k_slice_pr32 = o_k_base + gl.arange(0, BK//2, layout=slice1_b2d_pr32)
+    o_v_slice_pr32 = o_v_base + gl.arange(0, BV, layout=slice2_b2d_pr32)
 
-    TH_base_k = (bos * H + i_h) * K
-    p_q = q + TH_base_k + o_k_blocked_N
-    p_k = k + TH_base_k + o_k_blocked_N
+    TH_base_k = (bos * H + i_h) * K // 2
+    p_q = q_pr32 + TH_base_k + o_k_blocked_N_pr32
+    p_k = k_pr32 + TH_base_k + o_k_blocked_N_pr32
     TH_base_v = (bos * HV + i_hv) * V
     p_v = v + TH_base_v + o_v_blocked_M
 
@@ -753,17 +764,19 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
     mask_o = maskx[None,:]&masky[:,None]
 
     b_h = gl.zeros([BV, BK], dtype=gl.float32, layout=blocked2d)
+    
     if USE_INITIAL_STATE:
         if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_v_slice[:, None] * K
-                + o_k_slice[None, :] 
+            p_h0_pr32 = (
+                h0_source_pr32
+                + idx * HV * K // 2 * V
+                + i_hv * K // 2 * V
+                + o_v_slice_pr32[:, None] * K//2
+                + o_k_slice_pr32[None, :] 
             )
             # b_h += gl.load(p_h0, mask=mask_h, other=0.0).to(gl.float32)  # BKxBVxf32
-            b_h += gl.load(p_h0).to(gl.float32)  # BKxBVxf32
+            # Treat each 32-bit lane as packed [fp16_lo | fp16_hi] bits.            
+            b_h += _load_unpack_uint32(p_h0_pr32).reshape([BV,BK])
             
     for _ in range(0, T):
         b_dt_bias = gl.load(p_dt_bias).to(gl.float32) # f32
@@ -773,8 +786,8 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
         # b_k = gl.load(p_k, mask=mask_k_blocked, other=0.0).to(gl.float32)  # BKxf32
         # b_q = gl.load(p_q, mask=mask_k_blocked, other=0.0).to(gl.float32)  # BKxf32
         # b_v = gl.load(p_v, mask=mask_v_blocked, other=0.0).to(gl.float32)  # BVxf32
-        b_k = gl.load(p_k).to(gl.float32)  # BKxf32
-        b_q = gl.load(p_q).to(gl.float32)  # BKxf32
+        b_k = _load_unpack_uint32(p_k).reshape([BK]).to(gl.float32)  # BKxf32
+        b_q = _load_unpack_uint32(p_q).reshape([BK]).to(gl.float32)  # BKxf32
         b_v = gl.load(p_v).to(gl.float32)  # BVxf32
         
         softplus_beta_inv = 1.0 / softplus_beta
@@ -812,8 +825,10 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
 
         # Delta rule: v -= sum(h * k, dim=0)
         # @TODO: place K in the 2nd axis
-        b_k_col = gl.convert_layout(b_k[None, :], b_h.type.layout)
-        b_q_col = gl.convert_layout(b_q[None, :], b_h.type.layout)
+        b_k_s = gl.convert_layout(b_k, slice2_b1d1)
+        b_q_s = gl.convert_layout(b_q, slice2_b1d1)
+        b_k_col = gl.convert_layout(b_k_s[None, :], b_h.type.layout)
+        b_q_col = gl.convert_layout(b_q_s[None, :], b_h.type.layout)
 
         delta = gl.sum(b_h * b_k_col, 1)       
         delta = gl.convert_layout(delta, b_v.type.layout)
@@ -846,14 +861,22 @@ def gluon_fused_sigmoid_gating_delta_rule_update_kernel3(
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
         if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_v_slice[:, None] * K
-                + o_k_slice[None, :] 
+            b_h0 = b_h.to(gl.float16)
+            b_h0_lo, b_h0_hi = gl.split(b_h0.reshape(BV, BK//2, 2))
+            b_h0_pr32 = (
+                (b_h0_hi.to(gl.uint16, bitcast=True).to(gl.uint32) << 16)
+                | b_h0_lo.to(gl.uint16, bitcast=True).to(gl.uint32)
             )
-            gl.store(p_h0, b_h.to(p_h0.dtype.element_ty))
+            b_h0_pr32 = gl.convert_layout(b_h0_pr32, blocked2d_pr32)
+
+            p_h0_pr32 = (
+                h0_source_pr32
+                + idx * HV * K // 2 * V
+                + i_hv * K // 2 * V
+                + o_v_slice_pr32[:, None] * K//2
+                + o_k_slice_pr32[None, :] 
+            )
+            gl.store(p_h0_pr32, b_h0_pr32.to(p_h0_pr32.dtype.element_ty, bitcast=True))
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -1153,6 +1176,260 @@ def fused_sigmoid_gating_delta_rule_update_kernel_VK(
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+@triton.heuristics(
+    {
+        "T_PER_WARP_V": lambda nargs: 64 // nargs["T_PER_WARP_K"],
+        "WARP_SIZE": lambda nargs: nargs["num_warps"]
+    }
+)  # test kwargs
+@gluon.jit(do_not_specialize=["T"])
+def test_load_store(
+    A_log,
+    a,
+    dt_bias,
+    softplus_beta,
+    softplus_threshold,
+    q,
+    k,
+    v,
+    b,
+    o,
+    h0_source_pr32,
+    h0_indices,
+    cu_seqlens,
+    scale,
+    T,
+    B: gl.constexpr,
+    H: gl.constexpr,
+    HV: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    BK: gl.constexpr,
+    BV: gl.constexpr,
+    USE_INITIAL_STATE: gl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: gl.constexpr,
+    IS_VARLEN: gl.constexpr,
+    T_PER_WARP_K: gl.constexpr,
+    T_PER_WARP_V: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+):
+    """
+    Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
+    """
+    i_k, i_v, i_nh = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    
+    if IS_VARLEN:
+        bos, eos = (
+            gl.load(cu_seqlens + i_n).to(gl.int64),
+            gl.load(cu_seqlens + i_n + 1).to(gl.int64),
+        )
+        all = T
+        T = eos - bos
+    else:
+        bos, eos = i_n * T, i_n * T + T
+        all = B * T
+
+    if USE_INITIAL_STATE:
+        idx = gl.load(h0_indices + i_n)
+
+    p_A_log = A_log + i_hv
+    p_dt_bias = dt_bias + i_hv
+
+    # Gating computation pointers
+    p_a = a + bos * HV + i_hv
+    p_b = b + bos * HV + i_hv
+
+    # 4*dwords
+    DWORDS_SIZE: gl.constexpr = 4*4 #Bytes
+    if q.dtype.element_ty == gl.float16:
+        DTYPE_SIZE : gl.constexpr = 2
+    elif q.dtype.element_ty == gl.float8e5 or q.dtype.element_ty == gl.float8e4nv:
+        DTYPE_SIZE : gl.constexpr = 1
+    elif q.dtype.element_ty == gl.float32:
+        DTYPE_SIZE : gl.constexpr = 4
+    else:
+        DTYPE_SIZE : gl.constexpr = 2
+
+    ELE_PER_TILE: gl.constexpr = DWORDS_SIZE // DTYPE_SIZE
+    # gl.static_assert(BV%ELE_PER_TILE==0)
+    # gl.static_assert(BK%ELE_PER_TILE==0)
+
+    # h
+    V_PER_THREAD: gl.constexpr=BV//T_PER_WARP_V//WARP_SIZE
+    blocked2d_pr32: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[V_PER_THREAD, BK//T_PER_WARP_K//2],
+        threads_per_warp=[T_PER_WARP_V, T_PER_WARP_K],
+        warps_per_cta=[WARP_SIZE, 1],
+        order=[1, 0],
+    )
+    blocked2d: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[V_PER_THREAD, BK//T_PER_WARP_K],
+        threads_per_warp=[T_PER_WARP_V, T_PER_WARP_K],
+        warps_per_cta=[WARP_SIZE, 1],
+        order=[1, 0],
+    )
+    # k
+    blocked1: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, BK//T_PER_WARP_K],
+        threads_per_warp=[T_PER_WARP_V, T_PER_WARP_K],
+        warps_per_cta=[WARP_SIZE, 1],
+        order=[1, 0],
+    )
+    # v
+    blocked2: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[V_PER_THREAD, 1],
+        threads_per_warp=[T_PER_WARP_V, T_PER_WARP_K],
+        warps_per_cta=[WARP_SIZE, 1],
+        order=[0, 1],
+    )
+    
+    slice1_b2d: gl.constexpr = gl.SliceLayout(
+        dim=0,
+        parent=blocked2d,
+    )
+    slice2_b2d: gl.constexpr = gl.SliceLayout(
+        dim=1,
+        parent=blocked2d,
+    )
+
+    slice1_b2d_pr32: gl.constexpr = gl.SliceLayout(
+        dim=0,
+        parent=blocked2d_pr32,
+    )
+    slice2_b2d_pr32: gl.constexpr = gl.SliceLayout(
+        dim=1,
+        parent=blocked2d_pr32,
+    )
+
+    slice2_b1d1: gl.constexpr = gl.SliceLayout(
+        dim=0,
+        parent=blocked1,
+    )
+
+    slice1_b1d2: gl.constexpr = gl.SliceLayout(
+        dim=1,
+        parent=blocked2,
+    )
+
+    o_k_base = i_k * BK
+    o_v_base = i_v * BV
+    # o_k_blocked_M = i_k * BK + gl.arange(0, BK, layout=slice1_b1d1)
+    o_k_blocked_N = o_k_base + gl.arange(0, BK, layout=slice2_b1d1)
+    o_v_blocked_M = o_v_base + gl.arange(0, BV, layout=slice1_b1d2)
+    # o_v_blocked_N = i_v * BV + gl.arange(0, BV, layout=slice2_b1d2)
+    o_k_slice = o_k_base + gl.arange(0, BK, layout=slice1_b2d)
+    o_v_slice = o_v_base + gl.arange(0, BV, layout=slice2_b2d)
+    o_k_slice_pr32 = o_k_base + gl.arange(0, BK//2, layout=slice1_b2d_pr32)
+    o_v_slice_pr32 = o_v_base + gl.arange(0, BV, layout=slice2_b2d_pr32)
+
+    TH_base_k = (bos * H + i_h) * K
+    p_q = q + TH_base_k + o_k_blocked_N
+    p_k = k + TH_base_k + o_k_blocked_N
+    TH_base_v = (bos * HV + i_hv) * V
+    p_v = v + TH_base_v + o_v_blocked_M
+
+    T_PER_WARP_O: gl.constexpr = BV // ELE_PER_TILE // WARP_SIZE
+    DEN: gl.constexpr = 64 // T_PER_WARP_O
+    gl.static_assert((DEN & (DEN - 1)) == 0)  
+    expand_bo: gl.constexpr = DEN.bit_length() - 1
+
+    out_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, ELE_PER_TILE],
+        threads_per_warp=[64//T_PER_WARP_O, T_PER_WARP_O],
+        warps_per_cta=[1, WARP_SIZE],
+        order=[1,0],
+    )
+
+    slice1_b1d3: gl.constexpr = gl.SliceLayout(
+        dim=0,
+        parent=out_layout,
+    )
+    slice2_b1d3: gl.constexpr = gl.SliceLayout(
+        dim=1,
+        parent=out_layout,
+    )
+    x_axis = gl.arange(0, BV, layout=slice1_b1d3)
+    y_axis = gl.arange(0, 64//T_PER_WARP_O, layout=slice2_b1d3)
+    offs = x_axis[None,:] + y_axis[:, None]*BV
+    p_o = o + ((i_k * all) * HV ) * V + TH_base_v + offs
+    maskx = x_axis<V 
+    masky = y_axis == 0
+    mask_o = maskx[None,:]&masky[:,None]
+
+    b_h = gl.zeros([BV, BK], dtype=gl.float32, layout=blocked2d)
+    
+    if USE_INITIAL_STATE:
+        if idx >= 0:
+            p_h0_pr32 = (
+                h0_source_pr32
+                + idx * HV * K // 2 * V
+                + i_hv * K // 2 * V
+                + o_v_slice_pr32[:, None] * K//2
+                + o_k_slice_pr32[None, :] 
+            )
+            # b_h += gl.load(p_h0, mask=mask_h, other=0.0).to(gl.float32)  # BKxBVxf32
+            # Treat each 32-bit lane as packed [fp16_lo | fp16_hi] bits.
+            b_h0 = gl.load(p_h0_pr32).to(gl.uint32, bitcast=True)  # BV x (BK//2) packed
+            b_h0_lo = (b_h0 & 0xFFFF).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
+            b_h0_hi = (b_h0 >> 16).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
+            b_h0 = gl.join(b_h0_lo, b_h0_hi)
+            b_h += b_h0.reshape([BV,BK])
+            
+    acc = gl.zeros([DEN,BV], dtype=gl.float32, layout=out_layout)
+    for _ in range(0, T):
+        b_dt_bias = gl.load(p_dt_bias).to(gl.float32) # f32
+        b_A_log = gl.load(p_A_log).to(gl.float32) # f32
+        b_a = gl.load(p_a).to(gl.float32) # f32
+        b_b = gl.load(p_b).to(gl.float32) # f32
+        # b_k = gl.load(p_k, mask=mask_k_blocked, other=0.0).to(gl.float32)  # BKxf32
+        # b_q = gl.load(p_q, mask=mask_k_blocked, other=0.0).to(gl.float32)  # BKxf32
+        # b_v = gl.load(p_v, mask=mask_v_blocked, other=0.0).to(gl.float32)  # BVxf32
+        b_k = gl.load(p_k).to(gl.float32)  # BKxf32
+        b_q = gl.load(p_q).to(gl.float32)  # BKxf32
+        b_v = gl.load(p_v).to(gl.float32)  # BVxf32
+
+        # Keep values live.
+        acc += (
+            b_dt_bias
+            + b_A_log
+            + b_a
+            + b_b
+            + gl.sum(b_k, 0)
+            + gl.sum(b_q, 0)
+            + gl.sum(b_v, 0)
+        )
+
+        gl.store(p_o, acc.to(p_o.dtype.element_ty), mask=mask_o)
+
+        p_q += H * K
+        p_k += H * K
+        p_v += HV * V
+        p_o += HV * V
+        p_b += HV
+        p_a += HV
+
+    # Store final state back to h0_source with bounds checking
+    if USE_INITIAL_STATE:
+        if idx >= 0:
+            b_h0 = b_h.to(gl.float16)
+            b_h0_lo, b_h0_hi = gl.split(b_h0.reshape(BV, BK//2, 2))
+            b_h0_pr32 = (
+                (b_h0_hi.to(gl.uint16, bitcast=True).to(gl.uint32) << 16)
+                | b_h0_lo.to(gl.uint16, bitcast=True).to(gl.uint32)
+            )
+            b_h0_pr32 = gl.convert_layout(b_h0_pr32, blocked2d_pr32)
+
+            p_h0_pr32 = (
+                h0_source_pr32
+                + idx * HV * K // 2 * V
+                + i_hv * K // 2 * V
+                + o_v_slice_pr32[:, None] * K//2
+                + o_k_slice_pr32[None, :] 
+            )
+            gl.store(p_h0_pr32, b_h0_pr32.to(p_h0_pr32.dtype.element_ty, bitcast=True))
+
 @input_guard
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
@@ -1196,18 +1473,18 @@ def fused_sigmoid_gating_delta_rule_update(
         initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
         o_test = o.clone()
         print("run into gluon")
-        gluon_fused_sigmoid_gating_delta_rule_update_kernel3[grid](
+        gluon_fused_sigmoid_gating_delta_rule_update_kernel4[grid](
             A_log=A_log,
             a=a,
             dt_bias=dt_bias,
             softplus_beta=softplus_beta,
             softplus_threshold=softplus_threshold,
-            q=q,
-            k=k,
+            q_pr32=triton.reinterpret(q, gl.uint32),
+            k_pr32=triton.reinterpret(k, gl.uint32),
             v=v,
             b=b,
             o=o, # write
-            h0_source=initial_state_source, # update
+            h0_source_pr32=triton.reinterpret(initial_state_source, gl.uint32), # update
             h0_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             scale=scale,
@@ -1224,26 +1501,26 @@ def fused_sigmoid_gating_delta_rule_update(
             IS_VARLEN=cu_seqlens is not None,
             T_PER_WARP_K=16,
             T_PER_WARP_V=4,
-            WARP_SIZE=2,
-            num_warps=2,
-            num_stages=3,
+            WARP_SIZE=4,
+            num_warps=4,
+            num_stages=1,
         )
-        # print(gluon_fused_sigmoid_gating_delta_rule_update_kernel3.best_config)
-        # print(gluon_fused_sigmoid_gating_delta_rule_update_kernel3.configs_timings)
+        # print(gluon_fused_sigmoid_gating_delta_rule_update_kernel4.best_config)
+        # print(gluon_fused_sigmoid_gating_delta_rule_update_kernel4.configs_timings)
 
         torch.cuda.synchronize()
-        ms = triton.testing.do_bench(lambda: gluon_fused_sigmoid_gating_delta_rule_update_kernel3[grid](
+        ms = triton.testing.do_bench(lambda: gluon_fused_sigmoid_gating_delta_rule_update_kernel4[grid](
             A_log=A_log,
             a=a,
             dt_bias=dt_bias,
             softplus_beta=softplus_beta,
             softplus_threshold=softplus_threshold,
-            q=q,
-            k=k,
+            q_pr32=triton.reinterpret(q, gl.uint32),
+            k_pr32=triton.reinterpret(k, gl.uint32),
             v=v,
             b=b,
             o=o_test, # write
-            h0_source=initial_state_source_test, # update
+            h0_source_pr32=triton.reinterpret(initial_state_source, gl.uint32), # update
             h0_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             scale=scale,
@@ -1260,18 +1537,18 @@ def fused_sigmoid_gating_delta_rule_update(
             IS_VARLEN=cu_seqlens is not None,
             T_PER_WARP_K=16,
             T_PER_WARP_V=4,
-            WARP_SIZE=2,
-            num_warps=2,
-            num_stages=3,
+            WARP_SIZE=4,
+            num_warps=4,
+            num_stages=1,
             ),
-            warmup=2500, rep=3000,)
+            warmup=25, rep=30,)
         torch.cuda.synchronize()
         print("opt kernel ms", ms)
 
     else:        
         initial_state_source_test = initial_state_source.clone() if initial_state_source is not None else None
         o_test = o.clone()
-        fused_sigmoid_gating_delta_rule_update_kernel[grid](
+        gluon_fused_sigmoid_gating_delta_rule_update_kernel1[grid](
             A_log=A_log,
             a=a,
             dt_bias=dt_bias,
@@ -1302,7 +1579,7 @@ def fused_sigmoid_gating_delta_rule_update(
         )
 
         torch.cuda.synchronize()
-        ms = triton.testing.do_bench(lambda: fused_sigmoid_gating_delta_rule_update_kernel[grid](
+        ms = triton.testing.do_bench(lambda: gluon_fused_sigmoid_gating_delta_rule_update_kernel1[grid](
             A_log=A_log,
             a=a,
             dt_bias=dt_bias,
@@ -1331,7 +1608,7 @@ def fused_sigmoid_gating_delta_rule_update(
             num_warps=4,
             num_stages=1,
             ),
-            warmup=2500, rep=3000,)
+            warmup=25, rep=30,)
         torch.cuda.synchronize()
         print("ori kernel ms", ms)
 
